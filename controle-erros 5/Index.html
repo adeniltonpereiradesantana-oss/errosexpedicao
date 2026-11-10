@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <title><?= appNome ?></title>
+  <?!= include('Css'); ?>
+</head>
+<body data-empresa-url="<?= empresaUrl ?>">
+
+<!-- =============================== LOGIN =============================== -->
+<section id="tela-login" class="login-wrap">
+  <div class="login-card">
+    <div class="login-marca">
+      <div class="logo">CE</div>
+      <div>
+        <h1>Controle de Erros</h1>
+        <p>Expedição · empresa + código produtivo</p>
+      </div>
+    </div>
+
+    <!-- Passo 1: empresa + código -->
+    <form id="f-codigo" class="passo" autocomplete="off">
+      <div id="bloco-empresa">
+        <label for="l-empresa">Empresa</label>
+        <select id="l-empresa" required><option value="">Carregando…</option></select>
+      </div>
+      <div id="empresa-fixa" class="empresa-fixa oculto">
+        <span>Empresa: <b id="l-empresa-txt"></b></span>
+        <button class="btn link" type="button" id="btn-trocar-empresa">trocar</button>
+      </div>
+      <label for="l-cod">Código produtivo</label>
+      <input id="l-cod" inputmode="numeric" maxlength="20" placeholder="Ex.: 1234" required autofocus>
+      <button class="btn primario largo" type="submit">Continuar</button>
+    </form>
+
+    <!-- Passo 2a: senha -->
+    <form id="f-senha" class="passo oculto" autocomplete="off">
+      <p class="saudacao">Olá, <b class="l-nome"></b> <small class="muted l-emp"></small></p>
+      <label for="l-senha">Senha</label>
+      <input id="l-senha" type="password" maxlength="64" required autocomplete="current-password">
+      <button class="btn primario largo" type="submit">Entrar</button>
+      <button class="btn link" type="button" data-voltar>Usar outro código ou empresa</button>
+      <p class="dica-peq">Esqueceu a senha? Peça ao seu gestor para liberar um novo acesso.</p>
+    </form>
+
+    <!-- Passo 2b: criar senha (primeiro acesso) -->
+    <form id="f-criar" class="passo oculto" autocomplete="off">
+      <p class="saudacao">Olá, <b class="l-nome"></b>! Seu acesso foi liberado.<br>Crie sua senha para continuar.</p>
+      <div id="bloco-cod-lib">
+        <label for="l-lib">Código de liberação (6 dígitos, fornecido pelo gestor)</label>
+        <input id="l-lib" inputmode="numeric" maxlength="6" placeholder="000000">
+      </div>
+      <label for="l-nova">Nova senha</label>
+      <input id="l-nova" type="password" maxlength="64" required autocomplete="new-password">
+      <label for="l-conf">Confirme a senha</label>
+      <input id="l-conf" type="password" maxlength="64" required autocomplete="new-password">
+      <p class="dica-peq">Mínimo de 6 caracteres. Não use sequências como 123456.</p>
+      <button class="btn primario largo" type="submit">Criar senha e entrar</button>
+      <button class="btn link" type="button" data-voltar>Usar outro código</button>
+    </form>
+
+    <!-- Passo 2c: mensagens -->
+    <div id="f-msg" class="passo oculto">
+      <div id="l-msg" class="aviso"></div>
+      <button id="btn-solicitar" class="btn primario largo oculto" type="button">Solicitar acesso</button>
+      <button class="btn link" type="button" data-voltar>Voltar</button>
+    </div>
+
+    <div id="login-erro" class="erro oculto" role="alert"></div>
+  </div>
+  <p class="rodape-login"><?= appNome ?> · v<?= appVersao ?></p>
+</section>
+
+<!-- =============================== APP =============================== -->
+<section id="tela-app" class="oculto">
+  <header class="topo">
+    <div class="topo-esq">
+      <div class="logo peq">CE</div>
+      <div>
+        <div class="topo-titulo">Controle de Erros de Expedição</div>
+        <div class="topo-sub" id="u-filial"></div>
+      </div>
+    </div>
+    <nav class="abas" id="abas">
+      <button class="aba ativa" data-aba="lancamento">Lançamento</button>
+      <button class="aba" data-aba="painel" data-perm="painel">Painel gerencial</button>
+      <button class="aba" data-aba="usuarios" data-perm="usuarios">Usuários <span class="badge oculto" id="badge-pend"></span></button>
+      <button class="aba" data-aba="config" data-perm="admin">Configurações</button>
+    </nav>
+    <div class="topo-dir">
+      <div class="usuario-chip" id="u-chip" tabindex="0">
+        <span class="avatar" id="u-avatar"></span>
+        <span><b id="u-nome"></b><small id="u-perfil"></small></span>
+        <div class="menu-usuario">
+          <button type="button" id="btn-trocar-senha">Trocar senha</button>
+          <button type="button" id="btn-sair">Sair</button>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <!-- ------------------------- LANÇAMENTO ------------------------- -->
+    <div class="vista" id="v-lancamento">
+      <div class="grade-lanc">
+        <form class="card" id="f-lanc" autocomplete="off">
+          <h2>Registrar erro</h2>
+          <label for="c-cod">Código produtivo do colaborador</label>
+          <div class="combo">
+            <input id="c-cod" maxlength="60" placeholder="Digite o código ou o nome" required>
+            <ul class="sugestoes oculto" id="c-sug"></ul>
+          </div>
+          <div class="colab-card vazio" id="c-colab">Nenhum colaborador selecionado</div>
+
+          <label>Tipo de erro <small class="muted">(atalho: teclas 1–9)</small></label>
+          <div class="chips" id="c-tipos"></div>
+
+          <div class="linha2">
+            <div>
+              <label for="c-pedido">Pedido / carga <small class="muted">(opcional)</small></label>
+              <input id="c-pedido" maxlength="40">
+            </div>
+            <div>
+              <label for="c-qtd">Quantidade <small class="muted">(opcional)</small></label>
+              <input id="c-qtd" inputmode="decimal" maxlength="12">
+            </div>
+          </div>
+          <label for="c-obs">Observação <small class="muted">(opcional)</small></label>
+          <textarea id="c-obs" maxlength="300" rows="2"></textarea>
+
+          <button class="btn primario largo" type="submit" id="btn-registrar">Registrar erro</button>
+        </form>
+
+        <div class="card">
+          <div class="card-cab">
+            <h2>Lançamentos de hoje</h2>
+            <div class="cab-acoes">
+              <span class="muted" id="hoje-total"></span>
+              <span class="atualizado" id="hoje-atualizado"></span>
+              <button class="btn mini" id="btn-atualizar-hoje" type="button" title="Buscar os lançamentos mais recentes"><span class="ic-at">⟳</span> Atualizar</button>
+            </div>
+          </div>
+          <div class="lista-hoje" id="lista-hoje"><div class="vazio-box">Carregando…</div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ------------------------- PAINEL ------------------------- -->
+    <div class="vista oculto" id="v-painel">
+      <div class="filtros card">
+        <div class="empresa-pills oculto" id="empresa-pills"></div>
+        <div class="presets" id="presets">
+          <button data-p="hoje">Hoje</button>
+          <button data-p="7">7 dias</button>
+          <button data-p="30" class="ativo">30 dias</button>
+          <button data-p="mes">Mês atual</button>
+          <button data-p="mesant">Mês anterior</button>
+          <button data-p="ano">Ano</button>
+        </div>
+        <div class="filtros-campos">
+          <label>De <input type="date" id="p-de"></label>
+          <label>Até <input type="date" id="p-ate"></label>
+          <label id="lbl-filial">Filial <select id="p-filial"></select></label>
+          <label>Equipe <select id="p-equipe"></select></label>
+          <label>Tipo <select id="p-tipo"></select></label>
+          <label class="combo-lbl">Colaborador
+            <span class="combo">
+              <input id="p-colab" placeholder="Todos" maxlength="60">
+              <ul class="sugestoes oculto" id="p-sug"></ul>
+            </span>
+          </label>
+          <div class="filtros-acoes">
+            <span class="atualizado" id="p-atualizado"></span>
+            <button class="btn" id="btn-atualizar-painel" type="button" title="Buscar os dados mais recentes"><span class="ic-at">⟳</span> Atualizar</button>
+            <button class="btn" id="btn-limpar" type="button">Limpar</button>
+            <div class="menu-drop">
+              <button class="btn" type="button" id="btn-csv">CSV ▾</button>
+              <div class="drop">
+                <button type="button" data-csv="detalhado">Lançamentos detalhados</button>
+                <button type="button" data-csv="colaboradores">Resumo por colaborador</button>
+              </div>
+            </div>
+            <button class="btn primario" type="button" id="btn-pdf">PDF</button>
+          </div>
+        </div>
+        <div class="filtro-ativo oculto" id="filtro-colab"></div>
+      </div>
+
+      <div class="kpis" id="kpis"></div>
+
+      <div class="card online-card" id="online-card">
+        <div class="online-cab">
+          <span class="online-ponto"></span>
+          <b>Online agora</b>
+          <span class="online-total" id="online-total">–</span>
+          <div class="online-chips" id="online-chips"></div>
+          <span class="atualizado" id="online-hora"></span>
+        </div>
+        <div class="online-lista oculto" id="online-lista"></div>
+      </div>
+
+      <div class="graficos">
+        <div class="card larga">
+          <div class="card-cab"><h2 id="g-serie-tit">Ocorrências por dia</h2></div>
+          <div id="g-serie" class="g-area"></div>
+        </div>
+        <div class="card">
+          <div class="card-cab"><h2>Por tipo de erro</h2></div>
+          <div id="g-tipo"></div>
+        </div>
+        <div class="card">
+          <div class="card-cab"><h2>Top 10 colaboradores</h2><small class="muted">clique para filtrar</small></div>
+          <div id="g-top"></div>
+        </div>
+        <div class="card">
+          <div class="card-cab"><h2>Por equipe</h2></div>
+          <div id="g-equipe"></div>
+        </div>
+        <div class="card" id="card-filial">
+          <div class="card-cab"><h2>Por filial</h2></div>
+          <div id="g-filial"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-cab">
+          <h2>Ranking por colaborador</h2>
+          <input class="busca" id="r-busca" placeholder="Buscar…">
+        </div>
+        <div class="tabela-wrap"><table class="tabela" id="t-ranking"></table></div>
+      </div>
+
+      <div class="card">
+        <div class="card-cab">
+          <h2>Lançamentos</h2>
+          <input class="busca" id="d-busca" placeholder="Buscar…">
+        </div>
+        <div class="tabela-wrap"><table class="tabela" id="t-detalhe"></table></div>
+        <div class="paginacao" id="d-pag"></div>
+      </div>
+    </div>
+
+    <!-- ------------------------- USUÁRIOS ------------------------- -->
+    <div class="vista oculto" id="v-usuarios">
+      <div class="card">
+        <div class="card-cab">
+          <h2>Liberar primeiro acesso / resetar senha</h2>
+        </div>
+        <form class="liberar-linha" id="f-liberar" autocomplete="off">
+          <div class="combo">
+            <input id="u-lib-cod" placeholder="Código produtivo ou nome do colaborador" maxlength="60" required>
+            <ul class="sugestoes oculto" id="u-lib-sug"></ul>
+          </div>
+          <button class="btn primario" type="submit">Liberar acesso</button>
+        </form>
+        <p class="muted peq" id="u-lib-info"></p>
+      </div>
+
+      <div class="card">
+        <div class="card-cab">
+          <h2>Usuários</h2>
+          <div class="cab-acoes">
+            <select id="u-filtro-status">
+              <option value="">Todos os status</option>
+              <option>PENDENTE</option><option>LIBERADO</option><option>ATIVO</option>
+              <option>BLOQUEADO</option><option>BLOQ. TEMPORÁRIO</option><option>INATIVO</option>
+            </select>
+            <input class="busca" id="u-busca" placeholder="Buscar…">
+          </div>
+        </div>
+        <div class="tabela-wrap"><table class="tabela" id="t-usuarios"></table></div>
+      </div>
+    </div>
+
+    <!-- ------------------------- CONFIGURAÇÕES ------------------------- -->
+    <div class="vista oculto" id="v-config">
+      <div class="grade-2">
+        <div class="card">
+          <div class="card-cab"><h2>Tipos de erro</h2><button class="btn" id="btn-novo-tipo" type="button">+ Novo tipo</button></div>
+          <div class="tabela-wrap"><table class="tabela" id="t-tipos"></table></div>
+        </div>
+        <div class="card">
+          <div class="card-cab"><h2>Parâmetros</h2></div>
+          <form id="f-config" class="form-config"></form>
+          <div class="cab-acoes" style="margin-top:12px">
+            <button class="btn" type="button" id="btn-diag">Testar leitura de colaboradores</button>
+            <button class="btn" type="button" id="btn-atualizar-colab">Recarregar colaboradores</button>
+          </div>
+          <pre class="diag oculto" id="diag"></pre>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-cab"><h2>Auditoria</h2><input class="busca" id="a-busca" placeholder="Buscar…"></div>
+        <div class="tabela-wrap alta"><table class="tabela" id="t-auditoria"></table></div>
+      </div>
+    </div>
+  </main>
+</section>
+
+<!-- Modal genérico -->
+<div class="modal-fundo oculto" id="modal">
+  <div class="modal" role="dialog" aria-modal="true">
+    <h3 id="modal-tit"></h3>
+    <div id="modal-corpo"></div>
+    <div class="modal-acoes" id="modal-acoes"></div>
+  </div>
+</div>
+
+<div class="toast oculto" id="toast"></div>
+<div class="dica-flut oculto" id="dica"></div>
+<div class="carregando oculto" id="carregando"><div class="spinner"></div></div>
+
+<?!= include('Js'); ?>
+</body>
+</html>

@@ -1,0 +1,992 @@
+<script>
+'use strict';
+/* =====================================================================
+ *  Controle de Erros de Expedição — cliente
+ * ===================================================================== */
+var E = {
+  token: null, usuario: null, codLogin: '', empresa: '', empresas: [],
+  colabs: [], colabsCarregados: false,
+  tipos: [], tipoIdx: {}, tiposSel: [], colabSel: null,
+  recentes: [], minutosExcluir: 15,
+  painel: null, filtros: { de: '', ate: '', filial: '', equipe: '', tipo: '', cod: '', empColab: '' },
+  ordRanking: { col: 'total', dir: -1 }, ordDetalhe: { col: 'ts', dir: -1 }, pagDetalhe: 1,
+  usuarios: [], filiais: [], tiposCfg: [], auditoria: []
+};
+var POR_PAGINA = 50;
+
+/* ---------------------------- utilitários ---------------------------- */
+function $(id) { return document.getElementById(id); }
+function esc(v) {
+  return String(v === null || v === undefined ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+function norm(v) { return String(v || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase(); }
+function brl(n) { return 'R$ ' + num(n, 2); }
+function textoRegra(r) { return r ? brl(r.valor) + (r.modo === 'POR_ERRO' ? ' por erro' : ' por lançamento') : ''; }
+function num(n, d) { return Number(n || 0).toLocaleString('pt-BR', { minimumFractionDigits: d || 0, maximumFractionDigits: d || 0 }); }
+function hojeISO(off) { var d = new Date(); d.setDate(d.getDate() + (off || 0)); return isoLocal(d); }
+function isoLocal(d) { return d.getFullYear() + '-' + ('0' + (d.getMonth() + 1)).slice(-2) + '-' + ('0' + d.getDate()).slice(-2); }
+function br(iso) { return iso ? iso.substring(8, 10) + '/' + iso.substring(5, 7) + '/' + iso.substring(0, 4) : ''; }
+function corTipo(nome) { var i = E.tipoIdx[nome]; return 'var(--t' + (((i === undefined ? 7 : i) % 8) + 1) + ')'; }
+function tagTipo(t) { return '<span class="tag"><span class="bola" style="background:' + corTipo(t) + '"></span>' + esc(t) + '</span>'; }
+function iniciais(n) { var p = String(n || '').trim().split(/\s+/); return ((p[0] || '')[0] || '') + ((p.length > 1 ? p[p.length - 1][0] : '') || ''); }
+function guardar(k, v) { try { if (v === null) sessionStorage.removeItem(k); else sessionStorage.setItem(k, v); } catch (e) { } }
+function ler(k) { try { return sessionStorage.getItem(k); } catch (e) { return null; } }
+function guardarLocal(k, v) { try { localStorage.setItem(k, v); } catch (e) { } }
+function lerLocal(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+function chaveEmp(v) { return norm(v).replace(/[^a-z0-9]/g, ''); }
+/** O usuário enxerga mais de uma empresa? (mostra a empresa junto do colaborador) */
+function multiEmpresa() { return !!(E.usuario && (E.usuario.filial === 'TODAS' || E.usuario.perfil === 'ADMIN')); }
+
+var _toastT;
+function toast(msg, tipo) {
+  var t = $('toast'); t.textContent = msg; t.className = 'toast ' + (tipo || '');
+  clearTimeout(_toastT); _toastT = setTimeout(function () { t.classList.add('oculto'); }, tipo === 'erro' ? 5000 : 2600);
+}
+function carregando(on) { $('carregando').classList.toggle('oculto', !on); }
+
+/** Chamada ao servidor com Promise; trata sessão expirada. */
+function api(fn) {
+  var args = Array.prototype.slice.call(arguments, 1);
+  return new Promise(function (ok, falha) {
+    google.script.run.withSuccessHandler(ok).withFailureHandler(function (e) {
+      var msg = (e && e.message) ? e.message : String(e);
+      if (msg.indexOf('SESSAO_EXPIRADA') >= 0) { voltarLogin(msg.replace(/^.*SESSAO_EXPIRADA:\s*/, '')); }
+      falha(new Error(msg.replace(/^Error:\s*/, '')));
+    })[fn].apply(null, args);
+  });
+}
+function erroToast(e) { if (String(e.message).indexOf('SESSAO_EXPIRADA') < 0) toast(e.message, 'erro'); }
+
+function baixar(nome, conteudo, tipo, base64) {
+  var blob;
+  if (base64) {
+    var bin = atob(conteudo), arr = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    blob = new Blob([arr], { type: tipo });
+  } else blob = new Blob([conteudo], { type: tipo });
+  var url = URL.createObjectURL(blob), a = document.createElement('a');
+  a.href = url; a.download = nome; document.body.appendChild(a); a.click();
+  setTimeout(function () { URL.revokeObjectURL(url); a.remove(); }, 1500);
+}
+
+/* ---------------------------- modal ---------------------------- */
+function modal(titulo, corpoHtml, botoes) {
+  $('modal-tit').textContent = titulo;
+  $('modal-corpo').innerHTML = corpoHtml;
+  var box = $('modal-acoes'); box.innerHTML = '';
+  (botoes || [{ txt: 'Fechar' }]).forEach(function (b) {
+    var el = document.createElement('button');
+    el.type = 'button'; el.className = 'btn ' + (b.cls || ''); el.textContent = b.txt;
+    el.onclick = function () { if (!b.fn || b.fn() !== false) fecharModal(); };
+    box.appendChild(el);
+  });
+  $('modal').classList.remove('oculto');
+  var f = $('modal-corpo').querySelector('input,textarea,select'); if (f) setTimeout(function () { f.focus(); }, 30);
+}
+function fecharModal() { $('modal').classList.add('oculto'); }
+$('modal').addEventListener('click', function (e) { if (e.target.id === 'modal') fecharModal(); });
+document.addEventListener('keydown', function (e) { if (e.key === 'Escape') { fecharModal(); fecharSugestoes(); } });
+
+/* ---------------------------- combobox ---------------------------- */
+var _combos = [];
+function fecharSugestoes() { _combos.forEach(function (c) { c.ul.classList.add('oculto'); }); }
+function criarCombo(input, ul, fonte, aoEscolher) {
+  var itens = [], sel = -1, c = { ul: ul };
+  _combos.push(c);
+  function render() {
+    var q = input.value.trim();
+    itens = q ? fonte(q) : [];
+    sel = itens.length ? 0 : -1;
+    if (!itens.length) { ul.innerHTML = q ? '<li class="muted">Nenhum colaborador encontrado</li>' : ''; ul.classList.toggle('oculto', !q); return; }
+    ul.innerHTML = itens.map(function (it, i) {
+      return '<li data-i="' + i + '" class="' + (i === sel ? 'sel' : '') + '"><b>' + esc(it.cod) + '</b><span>' + esc(it.nome) +
+        (multiEmpresa() && it.filial ? ' <span class="emp">' + esc(it.filial) + '</span>' : '') +
+        '</span><small>' + esc(it.equipe || '') + '</small></li>';
+    }).join('');
+    ul.classList.remove('oculto');
+  }
+  function marcar() { Array.prototype.forEach.call(ul.children, function (li, i) { li.classList.toggle('sel', i === sel); if (i === sel) li.scrollIntoView({ block: 'nearest' }); }); }
+  function escolher(i) { if (itens[i]) { ul.classList.add('oculto'); aoEscolher(itens[i]); } }
+  input.addEventListener('input', render);
+  input.addEventListener('focus', function () { if (input.value.trim() && !input.dataset.escolhido) render(); });
+  input.addEventListener('keydown', function (e) {
+    if (e.key === 'ArrowDown') { sel = Math.min(sel + 1, itens.length - 1); marcar(); e.preventDefault(); }
+    else if (e.key === 'ArrowUp') { sel = Math.max(sel - 1, 0); marcar(); e.preventDefault(); }
+    else if (e.key === 'Enter' && !ul.classList.contains('oculto') && itens.length) { e.preventDefault(); escolher(sel < 0 ? 0 : sel); }
+  });
+  ul.addEventListener('mousedown', function (e) { var li = e.target.closest('li[data-i]'); if (li) { e.preventDefault(); escolher(+li.dataset.i); } });
+  input.addEventListener('blur', function () { setTimeout(function () { ul.classList.add('oculto'); }, 120); });
+  return { render: render };
+}
+
+/** Busca colaborador por código (prioridade) ou nome. */
+function buscarColabs(q) {
+  var nq = norm(q), soDig = /^\d+$/.test(q), exato = [], ini = [], cont = [];
+  E.colabs.forEach(function (c) {
+    if (soDig) { if (c.cod === q) exato.push(c); else if (c.cod.indexOf(q) === 0) ini.push(c); }
+    else { var n = norm(c.nome); if (n.indexOf(nq) === 0) ini.push(c); else if (n.indexOf(nq) >= 0) cont.push(c); }
+  });
+  return exato.concat(ini.sort(function (a, b) { return a.cod.length - b.cod.length || a.nome.localeCompare(b.nome); }), cont).slice(0, 12);
+}
+
+function carregarColabs(forcar) {
+  if (E.colabsCarregados && !forcar) return Promise.resolve(E.colabs);
+  return api('listarColaboradores', E.token).then(function (l) { E.colabs = l; E.colabsCarregados = true; return l; });
+}
+
+/* =====================================================================
+ *  LOGIN
+ * ===================================================================== */
+function mostrarPasso(id) {
+  ['f-codigo', 'f-senha', 'f-criar', 'f-msg'].forEach(function (p) { $(p).classList.toggle('oculto', p !== id); });
+  $('login-erro').classList.add('oculto');
+  var f = $(id).querySelector('input:not([type=hidden])'); if (f) setTimeout(function () { f.focus(); }, 30);
+}
+function erroLogin(msg) { var e = $('login-erro'); e.textContent = msg; e.classList.remove('oculto'); }
+function travar(form, on) { Array.prototype.forEach.call(form.querySelectorAll('button,input'), function (b) { b.disabled = on; }); }
+
+/* ---------- Empresa no login ---------- */
+function carregarEmpresas() {
+  api('listarEmpresas').then(function (lista) {
+    E.empresas = lista;
+    var sel = $('l-empresa');
+    sel.innerHTML = '<option value="">Selecione a empresa…</option>' + lista.map(function (e) { return '<option>' + esc(e) + '</option>'; }).join('');
+    var daUrl = document.body.getAttribute('data-empresa-url') || '';
+    var achouUrl = daUrl && lista.filter(function (e) { return chaveEmp(e) === chaveEmp(daUrl); })[0];
+    var salva = lerLocal('ce_empresa');
+    if (achouUrl) { definirEmpresaLogin(achouUrl, true); }
+    else if (salva && lista.indexOf(salva) >= 0) { sel.value = salva; definirEmpresaLogin(salva, true); }
+    else if (lista.length === 1) { sel.value = lista[0]; definirEmpresaLogin(lista[0], true); }
+  }).catch(function (e) { $('l-empresa').innerHTML = '<option value="">Erro ao carregar</option>'; erroLogin(e.message); });
+}
+/** fixa = mostra a empresa como texto (com "trocar"), sem a lista. */
+function definirEmpresaLogin(emp, fixa) {
+  E.empresa = emp; $('l-empresa').value = emp; $('l-empresa-txt').textContent = emp;
+  $('bloco-empresa').classList.toggle('oculto', !!fixa);
+  $('empresa-fixa').classList.toggle('oculto', !fixa);
+}
+$('btn-trocar-empresa').addEventListener('click', function () { definirEmpresaLogin($('l-empresa').value, false); $('l-empresa').focus(); });
+$('l-empresa').addEventListener('change', function () { E.empresa = this.value; });
+
+$('f-codigo').addEventListener('submit', function (e) {
+  e.preventDefault();
+  var cod = $('l-cod').value.trim(); if (!cod) return;
+  E.empresa = $('l-empresa').value;
+  if (!E.empresa) { erroLogin('Selecione a empresa.'); return; }
+  travar(this, true);
+  var form = this;
+  api('verificarCodigo', E.empresa, cod).then(function (r) {
+    travar(form, false);
+    E.codLogin = cod;
+    Array.prototype.forEach.call(document.querySelectorAll('.l-nome'), function (el) { el.textContent = r.nome || ''; });
+    Array.prototype.forEach.call(document.querySelectorAll('.l-emp'), function (el) { el.textContent = '· ' + E.empresa; });
+    var msg = $('l-msg'), sol = $('btn-solicitar');
+    sol.classList.add('oculto');
+    if (r.etapa === 'SENHA') { $('l-senha').value = ''; mostrarPasso('f-senha'); }
+    else if (r.etapa === 'CRIAR_SENHA') {
+      $('bloco-cod-lib').classList.toggle('oculto', !r.exigeCodigo);
+      ['l-lib', 'l-nova', 'l-conf'].forEach(function (i) { $(i).value = ''; });
+      mostrarPasso('f-criar');
+    }
+    else {
+      var textos = {
+        PENDENTE: 'Olá, ' + esc(r.nome) + '. Sua solicitação de acesso está aguardando a liberação do gestor.',
+        SOLICITAR: 'Olá, ' + esc(r.nome) + '. Você ainda não tem acesso ao sistema. Solicite e peça ao seu gestor para liberar o primeiro acesso.',
+        BLOQUEADO: 'Acesso bloqueado. Procure o seu gestor.',
+        INATIVO: 'Este código está inativo. Procure o seu gestor ou o RH.',
+        INEXISTENTE: 'Código produtivo não encontrado na base de colaboradores.'
+      };
+      msg.innerHTML = textos[r.etapa] || 'Não foi possível continuar.';
+      sol.classList.toggle('oculto', r.etapa !== 'SOLICITAR');
+      mostrarPasso('f-msg');
+    }
+  }).catch(function (err) { travar(form, false); erroLogin(err.message); });
+});
+
+$('btn-solicitar').addEventListener('click', function () {
+  var b = this; b.disabled = true;
+  api('solicitarAcesso', E.empresa, E.codLogin).then(function (r) {
+    $('l-msg').textContent = r.msg; b.classList.add('oculto'); b.disabled = false;
+  }).catch(function (err) { b.disabled = false; erroLogin(err.message); });
+});
+
+$('f-senha').addEventListener('submit', function (e) {
+  e.preventDefault();
+  var form = this; travar(form, true);
+  api('entrar', E.empresa, E.codLogin, $('l-senha').value).then(function (r) { travar(form, false); iniciarApp(r); })
+    .catch(function (err) { travar(form, false); $('l-senha').value = ''; erroLogin(err.message); });
+});
+
+$('f-criar').addEventListener('submit', function (e) {
+  e.preventDefault();
+  if ($('l-nova').value !== $('l-conf').value) { erroLogin('As senhas não conferem.'); return; }
+  var form = this; travar(form, true);
+  api('criarSenha', E.empresa, E.codLogin, $('l-lib').value, $('l-nova').value, $('l-conf').value)
+    .then(function (r) { travar(form, false); toast('Senha criada com sucesso!', 'ok'); iniciarApp(r); })
+    .catch(function (err) { travar(form, false); erroLogin(err.message); });
+});
+
+Array.prototype.forEach.call(document.querySelectorAll('[data-voltar]'), function (b) {
+  b.addEventListener('click', function () { $('l-cod').value = ''; mostrarPasso('f-codigo'); });
+});
+
+function voltarLogin(msg) {
+  pararPresenca();
+  E.token = null; E.usuario = null; E.colabs = []; E.colabsCarregados = false; E.painel = null;
+  guardar('ce_token', null);
+  fecharModal(); carregando(false);
+  $('tela-app').classList.add('oculto'); $('tela-login').classList.remove('oculto');
+  $('l-cod').value = ''; mostrarPasso('f-codigo');
+  if (msg) erroLogin(msg);
+}
+
+/* ---------- Presença: avisa o servidor a cada minuto que a tela está aberta ---------- */
+var _pingT = null;
+function iniciarPresenca() {
+  pararPresenca();
+  _pingT = setInterval(enviarPing, 60000);
+}
+function pararPresenca() { if (_pingT) clearInterval(_pingT); _pingT = null; }
+function enviarPing() {
+  if (!E.token) return;
+  api('ping', E.token).then(function (r) { if (r && r.online) renderOnline(r.online); }).catch(function () { });
+}
+document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'visible' && E.token) enviarPing(); });
+
+var _onlineSel = '';
+function renderOnline(o) {
+  if (!o || !$('online-card')) return;
+  E.online = o;
+  $('online-total').textContent = o.total;
+  $('online-hora').textContent = 'às ' + horaAgora() + ' · sem sinal há mais de ' + o.minutos + ' min = offline';
+  if (_onlineSel && !o.porEmpresa.some(function (g) { return g.empresa === _onlineSel; })) _onlineSel = '';
+  $('online-chips').innerHTML = o.porEmpresa.length ? o.porEmpresa.map(function (g) {
+    return '<button type="button" class="online-chip' + (g.empresa === _onlineSel ? ' ativo' : '') + '" data-emp="' + esc(g.empresa) + '">' +
+      esc(g.empresa) + '<b>' + g.total + '</b></button>';
+  }).join('') : '<span class="muted">Ninguém online no momento.</span>';
+  var box = $('online-lista'), g = o.porEmpresa.filter(function (x) { return x.empresa === _onlineSel; })[0];
+  box.classList.toggle('oculto', !g);
+  box.innerHTML = g ? g.pessoas.map(function (p) {
+    var rot = { ADMIN: 'Admin', GESTOR: 'Gestor', USER: 'Usuário' }[p.perfil] || p.perfil;
+    return '<div class="online-pessoa"><span class="avatar">' + esc(iniciais(p.nome).toUpperCase()) + '</span><span>' + esc(p.cod) + ' · ' + esc(p.nome) +
+      '</span><small>' + rot + ' · ' + (p.seg < 60 ? 'agora' : 'há ' + Math.round(p.seg / 60) + ' min') + '</small></div>';
+  }).join('') : '';
+}
+$('online-chips').addEventListener('click', function (e) {
+  var b = e.target.closest('[data-emp]'); if (!b) return;
+  _onlineSel = _onlineSel === b.dataset.emp ? '' : b.dataset.emp;
+  renderOnline(E.online);
+});
+
+function iniciarApp(r) {
+  E.token = r.token; E.usuario = r.usuario;
+  guardar('ce_token', r.token);
+  if (r.usuario.empresa) guardarLocal('ce_empresa', r.usuario.empresa);
+  var u = r.usuario;
+  $('u-nome').textContent = u.primeiroNome;
+  $('u-perfil').textContent = u.perfil === 'ADMIN' ? 'Administrador' : u.perfil === 'GESTOR' ? 'Gestor' : 'Usuário';
+  $('u-avatar').textContent = iniciais(u.nome).toUpperCase();
+  $('u-filial').textContent = u.empresa + (u.filial === 'TODAS' ? ' · acesso a todas as filiais' : '') + ' · ' + u.nome;
+  Array.prototype.forEach.call(document.querySelectorAll('[data-perm]'), function (el) { el.classList.toggle('oculto', !u.pode[el.dataset.perm]); });
+  $('tela-login').classList.add('oculto'); $('tela-app').classList.remove('oculto');
+  abrirAba('lancamento');
+  iniciarPresenca();
+  carregarColabs().catch(erroToast);
+  carregarLancamento();
+  if (u.pode.usuarios) atualizarBadgePendentes();
+}
+
+/* =====================================================================
+ *  ABAS E MENU
+ * ===================================================================== */
+function abrirAba(nome) {
+  Array.prototype.forEach.call(document.querySelectorAll('.aba'), function (a) { a.classList.toggle('ativa', a.dataset.aba === nome); });
+  Array.prototype.forEach.call(document.querySelectorAll('.vista'), function (v) { v.classList.toggle('oculto', v.id !== 'v-' + nome); });
+  if (nome === 'painel' && !E.painel) iniciarPainel();
+  if (nome === 'usuarios') carregarUsuarios();
+  if (nome === 'config') carregarConfig();
+  if (nome === 'lancamento') setTimeout(function () { $('c-cod').focus(); }, 30);
+}
+$('abas').addEventListener('click', function (e) { var b = e.target.closest('.aba'); if (b) abrirAba(b.dataset.aba); });
+
+$('btn-sair').addEventListener('click', function () { var t = E.token; voltarLogin(''); api('sair', t).catch(function () { }); });
+
+$('btn-trocar-senha').addEventListener('click', function () {
+  modal('Trocar senha',
+    '<label>Senha atual</label><input type="password" id="ts-atual" maxlength="64">' +
+    '<label>Nova senha</label><input type="password" id="ts-nova" maxlength="64">' +
+    '<label>Confirme a nova senha</label><input type="password" id="ts-conf" maxlength="64">',
+    [{ txt: 'Cancelar' }, { txt: 'Salvar', cls: 'primario', fn: function () {
+      carregando(true);
+      api('trocarSenha', E.token, $('ts-atual').value, $('ts-nova').value, $('ts-conf').value).then(function (r) {
+        carregando(false); E.token = r.token; guardar('ce_token', r.token); fecharModal(); toast('Senha alterada.', 'ok');
+      }).catch(function (e) { carregando(false); erroToast(e); });
+      return false;
+    } }]);
+});
+
+/* =====================================================================
+ *  LANÇAMENTO
+ * ===================================================================== */
+function horaAgora() { var d = new Date(); return ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2); }
+function botaoAtualizando(id, on) { var b = $(id); if (b) { b.disabled = on; b.classList.toggle('girando', on); } }
+
+function carregarLancamento() {
+  botaoAtualizando('btn-atualizar-hoje', true);
+  return api('dadosLancamento', E.token).then(function (d) {
+    botaoAtualizando('btn-atualizar-hoje', false);
+    $('hoje-atualizado').textContent = 'Atualizado às ' + horaAgora();
+    E.tipos = d.tipos; E.minutosExcluir = d.minutosExcluir;
+    d.tipos.forEach(function (t) { E.tipoIdx[t.nome] = t.idx; });
+    E.recentes = d.recentes;
+    renderTipos(); renderRecentes();
+  }).catch(function (e) { botaoAtualizando('btn-atualizar-hoje', false); erroToast(e); });
+}
+$('btn-atualizar-hoje').addEventListener('click', function () { carregarLancamento(); });
+
+function renderTipos() {
+  $('c-tipos').innerHTML = E.tipos.map(function (t, i) {
+    return '<button type="button" class="chip' + (E.tiposSel.indexOf(t.nome) >= 0 ? ' on' : '') + '" data-tipo="' + esc(t.nome) + '">' +
+      '<span class="bola" style="background:' + corTipo(t.nome) + '"></span>' + esc(t.nome) +
+      (i < 9 ? ' <span class="k">' + (i + 1) + '</span>' : '') + '</button>';
+  }).join('') || '<span class="muted">Nenhum tipo de erro ativo. Peça ao administrador para cadastrar.</span>';
+}
+function alternarTipo(nome) {
+  var i = E.tiposSel.indexOf(nome);
+  if (i >= 0) E.tiposSel.splice(i, 1); else E.tiposSel.push(nome);
+  renderTipos();
+}
+$('c-tipos').addEventListener('click', function (e) { var b = e.target.closest('.chip'); if (b) alternarTipo(b.dataset.tipo); });
+/* Atalhos 1–9 marcam os tipos de erro (fora dos campos de texto, ou no campo do colaborador já escolhido). */
+document.addEventListener('keydown', function (e) {
+  if (!/^[1-9]$/.test(e.key) || e.ctrlKey || e.altKey || e.metaKey) return;
+  if ($('tela-app').classList.contains('oculto') || $('v-lancamento').classList.contains('oculto')) return;
+  if (!$('modal').classList.contains('oculto')) return;
+  var el = document.activeElement, emCampo = el && /INPUT|TEXTAREA|SELECT/.test(el.tagName);
+  if (emCampo && !(el.id === 'c-cod' && el.dataset.escolhido)) return;
+  var t = E.tipos[+e.key - 1];
+  if (t) { e.preventDefault(); alternarTipo(t.nome); }
+});
+
+function selecionarColab(c) {
+  E.colabSel = c;
+  var inp = $('c-cod');
+  inp.value = c.cod + ' — ' + c.nome; inp.dataset.escolhido = '1';
+  $('c-colab').className = 'colab-card';
+  $('c-colab').innerHTML = '<div class="cn">' + esc(c.nome) + '</div><div class="cd">Código ' + esc(c.cod) +
+    (c.equipe ? ' · ' + esc(c.equipe) : '') + (c.filial ? ' · ' + esc(c.filial) : '') + '</div>';
+}
+function limparColab() {
+  E.colabSel = null; delete $('c-cod').dataset.escolhido;
+  $('c-colab').className = 'colab-card vazio'; $('c-colab').textContent = 'Nenhum colaborador selecionado';
+}
+criarCombo($('c-cod'), $('c-sug'), buscarColabs, selecionarColab);
+$('c-cod').addEventListener('input', function () { if (this.dataset.escolhido) limparColab(); });
+$('c-cod').addEventListener('focus', function () { if (this.dataset.escolhido) this.select(); });
+
+$('f-lanc').addEventListener('submit', function (e) {
+  e.preventDefault();
+  if (!E.colabSel) {
+    var q = $('c-cod').value.trim(), achados = E.colabs.filter(function (c) { return c.cod === q; });
+    if (achados.length === 1) selecionarColab(achados[0]);
+    else { toast(achados.length > 1 ? 'Esse código existe em mais de uma empresa: escolha na lista.' : 'Selecione um colaborador válido.', 'erro'); $('c-cod').focus(); return; }
+  }
+  if (!E.tiposSel.length) { toast('Selecione pelo menos um tipo de erro.', 'erro'); return; }
+  var dados = { cod: E.colabSel.cod, empresa: E.colabSel.filial, tipos: E.tiposSel.slice(), pedido: $('c-pedido').value, quantidade: $('c-qtd').value, observacao: $('c-obs').value };
+  var btn = $('btn-registrar'); btn.disabled = true; btn.textContent = 'Registrando…';
+  api('registrarErro', E.token, dados).then(function (r) {
+    btn.disabled = false; btn.textContent = 'Registrar erro';
+    E.recentes.unshift(r.lancamento); renderRecentes(r.lancamento.id);
+    toast('Erro registrado: ' + r.lancamento.colaborador, 'ok');
+    $('c-cod').value = ''; limparColab(); E.tiposSel = []; renderTipos();
+    $('c-pedido').value = ''; $('c-qtd').value = ''; $('c-obs').value = '';
+    $('c-cod').focus();
+    E.painel = null; // força recarregar o painel na próxima visita
+  }).catch(function (err) { btn.disabled = false; btn.textContent = 'Registrar erro'; erroToast(err); });
+});
+
+function renderRecentes(destaque) {
+  var l = E.recentes;
+  var oc = l.reduce(function (a, x) { return a + x.qtdErros; }, 0);
+  $('hoje-total').textContent = l.length ? l.length + ' lançamento(s) · ' + oc + ' ocorrência(s)' : '';
+  var gestor = E.usuario.perfil !== 'USER';
+  $('lista-hoje').innerHTML = l.length ? l.map(function (x) {
+    var podeExcluir = gestor || (x.lancadoPorCod === E.usuario.cod && Date.now() - x.ts < E.minutosExcluir * 60000);
+    return '<div class="item-hoje' + (x.id === destaque ? ' novo' : '') + '"><div class="hora">' + esc(x.dataHora.substring(11)) + '</div>' +
+      '<div class="info"><div class="nome">' + esc(x.cod) + ' · ' + esc(x.colaborador) + '</div><div class="sub">' +
+      x.tipos.map(tagTipo).join('') + (x.pedido ? ' · Pedido ' + esc(x.pedido) : '') + (x.quantidade !== '' ? ' · Qtd ' + esc(x.quantidade) : '') +
+      (gestor ? ' · por ' + esc(x.lancadoPor) + ' · desconto ' + brl(x.desconto) : '') + '</div></div>' +
+      (podeExcluir ? '<button class="btn mini" data-excluir="' + esc(x.id) + '">Excluir</button>' : '') + '</div>';
+  }).join('') : '<div class="vazio-box">Nenhum lançamento hoje.</div>';
+}
+$('lista-hoje').addEventListener('click', function (e) {
+  var b = e.target.closest('[data-excluir]'); if (!b) return;
+  pedirCancelamento(b.dataset.excluir, function () {
+    E.recentes = E.recentes.filter(function (x) { return x.id !== b.dataset.excluir; }); renderRecentes();
+  });
+});
+
+function pedirCancelamento(id, depois) {
+  var gestor = E.usuario.perfil !== 'USER';
+  modal('Excluir lançamento',
+    (gestor ? '<label>Motivo do cancelamento</label><textarea id="m-motivo" rows="3" maxlength="200"></textarea>'
+      : '<p>Confirma a exclusão deste lançamento?</p>'),
+    [{ txt: 'Voltar' }, { txt: 'Excluir', cls: 'perigo', fn: function () {
+      var motivo = gestor ? $('m-motivo').value.trim() : '';
+      if (gestor && !motivo) { toast('Informe o motivo.', 'erro'); return false; }
+      carregando(true);
+      api('cancelarLancamento', E.token, id, motivo).then(function () {
+        carregando(false); fecharModal(); toast('Lançamento excluído.', 'ok'); E.painel = null; if (depois) depois();
+      }).catch(function (e) { carregando(false); erroToast(e); });
+      return false;
+    } }]);
+}
+
+/* =====================================================================
+ *  PAINEL GERENCIAL
+ * ===================================================================== */
+function aplicarPreset(p) {
+  var h = new Date(), de, ate = isoLocal(h);
+  if (p === 'hoje') de = ate;
+  else if (p === '7') de = hojeISO(-6);
+  else if (p === '30') de = hojeISO(-29);
+  else if (p === 'mes') de = isoLocal(new Date(h.getFullYear(), h.getMonth(), 1));
+  else if (p === 'mesant') { de = isoLocal(new Date(h.getFullYear(), h.getMonth() - 1, 1)); ate = isoLocal(new Date(h.getFullYear(), h.getMonth(), 0)); }
+  else if (p === 'ano') de = isoLocal(new Date(h.getFullYear(), 0, 1));
+  $('p-de').value = de; $('p-ate').value = ate;
+  Array.prototype.forEach.call(document.querySelectorAll('#presets button'), function (b) { b.classList.toggle('ativo', b.dataset.p === p); });
+}
+$('presets').addEventListener('click', function (e) { var b = e.target.closest('button'); if (b) { aplicarPreset(b.dataset.p); carregarPainel(); } });
+['p-de', 'p-ate'].forEach(function (id) {
+  $(id).addEventListener('change', function () {
+    Array.prototype.forEach.call(document.querySelectorAll('#presets button'), function (b) { b.classList.remove('ativo'); });
+    carregarPainel();
+  });
+});
+['p-filial', 'p-equipe', 'p-tipo'].forEach(function (id) { $(id).addEventListener('change', carregarPainel); });
+
+criarCombo($('p-colab'), $('p-sug'), buscarColabs, function (c) { definirColabFiltro(c.cod, c.nome, c.filial); });
+function definirColabFiltro(cod, nome, empresa) {
+  E.filtros.cod = cod || '';
+  E.filtros.empColab = cod ? (empresa || '') : '';
+  $('p-colab').value = '';
+  var box = $('filtro-colab');
+  if (cod) { box.innerHTML = 'Filtrando colaborador: <span class="tag">' + esc(cod) + ' · ' + esc(nome) + (multiEmpresa() && empresa ? ' · ' + esc(empresa) : '') + ' <button type="button" id="rm-colab" title="Remover">✕</button></span>' +
+      ' <span class="muted">— os botões CSV e PDF geram o relatório deste colaborador.</span>'; box.classList.remove('oculto'); }
+  else { box.classList.add('oculto'); box.innerHTML = ''; }
+  carregarPainel();
+}
+$('filtro-colab').addEventListener('click', function (e) { if (e.target.id === 'rm-colab') definirColabFiltro('', '', ''); });
+$('btn-limpar').addEventListener('click', function () {
+  $('p-filial').value = ''; $('p-equipe').value = ''; $('p-tipo').value = ''; aplicarPreset('30'); definirColabFiltro('', '', '');
+});
+
+function iniciarPainel() {
+  if (!$('p-de').value) aplicarPreset('30');
+  carregarColabs().then(carregarPainel).catch(erroToast);
+}
+
+function coletarFiltros() {
+  return { de: $('p-de').value, ate: $('p-ate').value, filial: $('p-filial').value, equipe: $('p-equipe').value, tipo: $('p-tipo').value, cod: E.filtros.cod, empColab: E.filtros.empColab };
+}
+
+var _seqPainel = 0;
+function carregarPainel() {
+  var f = coletarFiltros(), seq = ++_seqPainel;
+  $('kpis').style.opacity = .5;
+  botaoAtualizando('btn-atualizar-painel', true);
+  api('painel', E.token, f).then(function (d) {
+    if (seq !== _seqPainel) return; // resposta antiga
+    $('kpis').style.opacity = 1;
+    botaoAtualizando('btn-atualizar-painel', false);
+    $('p-atualizado').textContent = 'Atualizado às ' + horaAgora();
+    E.painel = d;
+    d.tiposOrdem.forEach(function (t, i) { E.tipoIdx[t] = i; });
+    preencherSelect('p-filial', d.opcoes.filiais, 'Todas', f.filial);
+    preencherSelect('p-equipe', d.opcoes.equipes, 'Todas', f.equipe);
+    preencherSelect('p-tipo', d.tiposOrdem, 'Todos', f.tipo);
+    // Com os botões de empresa visíveis, a lista "Filial" fica escondida (os botões fazem o mesmo filtro).
+    $('lbl-filial').classList.add('oculto');
+    $('card-filial').classList.toggle('oculto', d.porFilial.length < 2);
+    E.pagDetalhe = 1;
+    renderOnline(d.online); renderKpis(d); renderGraficos(d); renderRanking(); renderDetalhe(); renderEmpresaPills(d, f.filial);
+  }).catch(function (e) { $('kpis').style.opacity = 1; botaoAtualizando('btn-atualizar-painel', false); erroToast(e); });
+}
+$('btn-atualizar-painel').addEventListener('click', function () { carregarPainel(); });
+
+/** Botões de empresa (Admin ou Gestor com TODAS). Mesmo filtro da lista "Filial". */
+function renderEmpresaPills(d, atual) {
+  var box = $('empresa-pills'), lista = d.empresasBotoes || [];
+  var mostrar = lista.length > 1 && multiEmpresa();
+  box.classList.toggle('oculto', !mostrar);
+  if (!mostrar) return;
+  var online = {};
+  ((E.online && E.online.porEmpresa) || []).forEach(function (g) { online[g.empresa] = g.total; });
+  var total = lista.reduce(function (a, x) { return a + x.total; }, 0);
+  box.innerHTML = '<span class="rot">Empresa</span>' +
+    '<button type="button" class="emp-pill' + (!atual ? ' ativo' : '') + '" data-emp="">Todas <span class="qt">' + num(total) + '</span></button>' +
+    lista.map(function (e) {
+      return '<button type="button" class="emp-pill' + (e.nome === atual ? ' ativo' : '') + '" data-emp="' + esc(e.nome) + '" title="' +
+        num(e.total) + ' ocorrência(s) no período' + (online[e.nome] ? ' · ' + online[e.nome] + ' online agora' : '') + '">' +
+        (online[e.nome] ? '<span class="on"></span>' : '') + esc(e.nome) + ' <span class="qt">' + num(e.total) + '</span></button>';
+    }).join('');
+}
+$('empresa-pills').addEventListener('click', function (e) {
+  var b = e.target.closest('[data-emp]'); if (!b) return;
+  $('p-filial').value = b.dataset.emp;
+  Array.prototype.forEach.call(this.querySelectorAll('.emp-pill'), function (x) { x.classList.toggle('ativo', x === b); });
+  carregarPainel();
+});
+
+function preencherSelect(id, valores, rotuloTodos, atual) {
+  var s = $(id);
+  s.innerHTML = '<option value="">' + rotuloTodos + '</option>' + valores.map(function (v) {
+    return '<option' + (v === atual ? ' selected' : '') + '>' + esc(v) + '</option>';
+  }).join('');
+}
+
+function renderKpis(d) {
+  var k = d.kpis, v = k.variacao, vtxt;
+  if (v === null) vtxt = 'sem dados no período anterior';
+  else vtxt = '<span class="' + (v > 0 ? 'var-sobe' : v < 0 ? 'var-desce' : '') + '">' + (v > 0 ? '▲ +' : v < 0 ? '▼ ' : '') +
+    num(v * 100, 1) + '%</span> vs. período anterior (' + num(k.anterior) + ')';
+  var cards = [
+    ['Ocorrências de erro', num(k.ocorrencias), vtxt],
+    ['Lançamentos', num(k.lancamentos), br(d.filtros.de) + ' a ' + br(d.filtros.ate)],
+    ['Colaboradores com erro', num(k.colaboradores), d.ranking[0] ? 'Mais erros: ' + esc(d.ranking[0].nome.split(' ')[0]) + ' (' + d.ranking[0].total + ')' : '—'],
+    ['Média por dia', num(k.mediaDia, 1), k.dias + ' dia(s) no período' + (k.quantidade ? ' · ' + num(k.quantidade) + ' un.' : '')],
+    ['Desconto total', brl(k.desconto), 'Regra atual: ' + textoRegra(d.regraDesconto)]
+  ];
+  $('kpis').innerHTML = cards.map(function (c) {
+    return '<div class="kpi"><div class="kpi-label">' + c[0] + '</div><div class="kpi-valor">' + c[1] + '</div><div class="kpi-sub">' + c[2] + '</div></div>';
+  }).join('');
+}
+
+/* ---------- gráficos ---------- */
+var dica = $('dica');
+function mostrarDica(e, html) { dica.innerHTML = html; dica.classList.remove('oculto'); moverDica(e); }
+function moverDica(e) {
+  var x = e.clientX + 12, y = e.clientY - 34, w = dica.offsetWidth;
+  if (x + w > window.innerWidth - 8) x = e.clientX - w - 12;
+  dica.style.left = x + 'px'; dica.style.top = Math.max(4, y) + 'px';
+}
+function esconderDica() { dica.classList.add('oculto'); }
+
+function renderGraficos(d) {
+  $('g-serie-tit').textContent = d.serieMensal ? 'Ocorrências por mês' : 'Ocorrências por dia';
+  graficoColunas($('g-serie'), d.serie);
+  barrasH($('g-tipo'), d.porTipo.map(function (t) { return { nome: t.nome, total: t.total, cor: corTipo(t.nome) }; }), d.kpis.ocorrencias);
+  barrasH($('g-top'), d.ranking.slice(0, 10).map(function (c) {
+    return { nome: c.nome, rot: c.cod + ' · ' + c.nome, total: c.total, cod: c.cod, filial: c.filial,
+      dica: Object.keys(c.tipos).map(function (t) { return t + ': ' + c.tipos[t]; }).join(' · ') };
+  }), d.kpis.ocorrencias, function (it) { definirColabFiltro(it.cod, it.nome, it.filial); });
+  barrasH($('g-equipe'), d.porEquipe.slice(0, 12), d.kpis.ocorrencias);
+  barrasH($('g-filial'), d.porFilial, d.kpis.ocorrencias);
+}
+
+function escalaNice(max) {
+  if (max <= 4) return { max: Math.max(max, 1), passo: 1 };
+  var bruto = max / 4, mag = Math.pow(10, Math.floor(Math.log10(bruto))), r = bruto / mag;
+  var passo = (r <= 1 ? 1 : r <= 2 ? 2 : r <= 5 ? 5 : 10) * mag;
+  return { max: Math.ceil(max / passo) * passo, passo: passo };
+}
+
+function graficoColunas(box, serie) {
+  var total = serie.reduce(function (a, x) { return a + x.total; }, 0);
+  if (!total) { box.innerHTML = '<div class="g-vazio">Nenhuma ocorrência no período.</div>'; return; }
+  var W = Math.max(box.clientWidth, 320), H = 220, mL = 34, mR = 8, mT = 10, mB = 26;
+  var pw = W - mL - mR, ph = H - mT - mB, n = serie.length;
+  var esc_ = escalaNice(Math.max.apply(null, serie.map(function (x) { return x.total; })));
+  var slot = pw / n, bw = Math.max(2, Math.min(36, slot * 0.72)), gap = (slot - bw) / 2;
+  var y = function (v) { return mT + ph - v / esc_.max * ph; };
+  var s = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" role="img" aria-label="Ocorrências por período">';
+  s += '<g class="grade eixo">';
+  for (var v = 0; v <= esc_.max + 1e-9; v += esc_.passo) {
+    s += '<line x1="' + mL + '" x2="' + (W - mR) + '" y1="' + y(v) + '" y2="' + y(v) + '"></line>';
+    s += '<text x="' + (mL - 6) + '" y="' + (y(v) + 4) + '" text-anchor="end">' + num(v) + '</text>';
+  }
+  s += '</g>';
+  var cada = Math.ceil(n / Math.floor(pw / 46));
+  serie.forEach(function (x, i) {
+    var bx = mL + i * slot + gap, by = y(x.total), bh = mT + ph - by, r = Math.min(4, bw / 2, bh);
+    s += '<rect class="alvo" data-i="' + i + '" x="' + (mL + i * slot) + '" y="' + mT + '" width="' + slot + '" height="' + ph + '"></rect>';
+    if (x.total > 0) s += '<path class="barra" data-b="' + i + '" d="M' + bx + ',' + (by + bh) + 'V' + (by + r) + 'Q' + bx + ',' + by + ' ' + (bx + r) + ',' + by +
+      'H' + (bx + bw - r) + 'Q' + (bx + bw) + ',' + by + ' ' + (bx + bw) + ',' + (by + r) + 'V' + (by + bh) + 'Z"></path>';
+    if (i % cada === 0) s += '<text class="eixo" x="' + (bx + bw / 2) + '" y="' + (H - 8) + '" text-anchor="middle" style="fill:var(--muted);font-size:11px">' + esc(x.rotulo) + '</text>';
+  });
+  s += '<line x1="' + mL + '" x2="' + (W - mR) + '" y1="' + (mT + ph) + '" y2="' + (mT + ph) + '" stroke="#cfd6de"></line></svg>';
+  box.innerHTML = s;
+  Array.prototype.forEach.call(box.querySelectorAll('.alvo'), function (r) {
+    var i = +r.dataset.i, x = serie[i], b = box.querySelector('[data-b="' + i + '"]');
+    r.addEventListener('mousemove', function (e) {
+      if (b) b.classList.add('hover');
+      mostrarDica(e, esc(x.rotulo) + ': <b>' + num(x.total) + '</b> ocorrência' + (x.total === 1 ? '' : 's'));
+    });
+    r.addEventListener('mouseleave', function () { if (b) b.classList.remove('hover'); esconderDica(); });
+  });
+}
+
+function barrasH(box, itens, total, aoClicar) {
+  if (!itens.length) { box.innerHTML = '<div class="g-vazio">Sem dados.</div>'; return; }
+  var max = Math.max.apply(null, itens.map(function (x) { return x.total; })) || 1;
+  box.innerHTML = '<div class="hb">' + itens.map(function (it, i) {
+    var pct = total ? it.total / total * 100 : 0;
+    return '<div class="lin' + (aoClicar ? ' clicavel' : '') + '">' +
+      '<div class="r" data-i="' + i + '">' + esc(it.rot || it.nome) + '</div>' +
+      '<div class="trilho" data-i="' + i + '"><div class="b" style="width:' + Math.max(1, it.total / max * 100) + '%;' + (it.cor ? 'background:' + it.cor : '') + '"></div></div>' +
+      '<div class="v" data-i="' + i + '">' + num(it.total) + ' <small>' + num(pct, 0) + '%</small></div></div>';
+  }).join('') + '</div>';
+  Array.prototype.forEach.call(box.querySelectorAll('[data-i]'), function (el) {
+    var it = itens[+el.dataset.i];
+    el.addEventListener('mousemove', function (e) {
+      mostrarDica(e, esc(it.rot || it.nome) + ': <b>' + num(it.total) + '</b> (' + num(total ? it.total / total * 100 : 0, 1) + '%)' + (it.dica ? '<br>' + esc(it.dica) : ''));
+    });
+    el.addEventListener('mouseleave', esconderDica);
+    if (aoClicar) el.addEventListener('click', function () { esconderDica(); aoClicar(it); });
+  });
+}
+var _rsz;
+window.addEventListener('resize', function () { clearTimeout(_rsz); _rsz = setTimeout(function () { if (E.painel && !$('v-painel').classList.contains('oculto')) graficoColunas($('g-serie'), E.painel.serie); }, 200); });
+
+/* ---------- tabelas ---------- */
+function ordenar(lista, ord) {
+  return lista.slice().sort(function (a, b) {
+    var x = ord.get ? ord.get(a) : a[ord.col], y = ord.get ? ord.get(b) : b[ord.col];
+    if (typeof x === 'string' || typeof y === 'string') return String(x).localeCompare(String(y)) * ord.dir;
+    return ((x || 0) - (y || 0)) * ord.dir;
+  });
+}
+function cabecalho(cols, ord) {
+  return '<thead><tr>' + cols.map(function (c) {
+    var seta = ord && ord.col === c.k ? (ord.dir > 0 ? ' ▲' : ' ▼') : '';
+    return '<th class="' + (c.n ? 'n ' : '') + (c.k ? '' : 'sem-ord') + '"' + (c.k ? ' data-ord="' + esc(c.k) + '"' : '') + '>' + esc(c.t) + seta + '</th>';
+  }).join('') + '</tr></thead>';
+}
+function ligarOrdenacao(tabela, ord, rerender) {
+  tabela.querySelector('thead').addEventListener('click', function (e) {
+    var th = e.target.closest('th[data-ord]'); if (!th) return;
+    var k = th.dataset.ord;
+    if (ord.col === k) ord.dir *= -1; else { ord.col = k; ord.dir = (k === 'nome' || k === 'equipe' || k === 'filial' || k === 'colaborador') ? 1 : -1; }
+    ord.get = k.indexOf('tipo:') === 0 ? function (r) { return r.tipos[k.substring(5)] || 0; } : null;
+    rerender();
+  });
+}
+
+function renderRanking() {
+  var d = E.painel; if (!d) return;
+  var q = norm($('r-busca').value), multiFilial = d.porFilial.length > 1;
+  var lista = d.ranking.filter(function (c) { return !q || norm(c.cod + ' ' + c.nome + ' ' + c.equipe).indexOf(q) >= 0; });
+  lista = ordenar(lista, E.ordRanking);
+  var cols = [{ t: '#' }, { t: 'Código', k: 'cod' }, { t: 'Colaborador', k: 'nome' }, { t: 'Equipe', k: 'equipe' }];
+  if (multiFilial) cols.push({ t: 'Filial', k: 'filial' });
+  d.tiposOrdem.forEach(function (t) { if (d.porTipo.some(function (x) { return x.nome === t; })) cols.push({ t: t, k: 'tipo:' + t, n: 1 }); });
+  cols.push({ t: 'Total', k: 'total', n: 1 }, { t: '% do total', n: 1 }, { t: 'Desconto', k: 'desconto', n: 1 }, { t: 'Relatórios' });
+  var tiposVis = cols.filter(function (c) { return c.k && c.k.indexOf('tipo:') === 0; }).map(function (c) { return c.k.substring(5); });
+  var t = $('t-ranking');
+  t.innerHTML = cabecalho(cols, E.ordRanking) + '<tbody>' + (lista.length ? lista.map(function (c, i) {
+    return '<tr class="clicavel" data-cod="' + esc(c.cod) + '" data-nome="' + esc(c.nome) + '" data-empresa="' + esc(c.filial) + '"><td class="muted">' + (i + 1) + '</td><td>' + esc(c.cod) + '</td><td><b>' + esc(c.nome) + '</b></td><td>' + esc(c.equipe) + '</td>' +
+      (multiFilial ? '<td>' + esc(c.filial) + '</td>' : '') +
+      tiposVis.map(function (tp) { return '<td class="n">' + (c.tipos[tp] || '<span class="muted">0</span>') + '</td>'; }).join('') +
+      '<td class="n"><b>' + c.total + '</b></td><td class="n">' + num(d.kpis.ocorrencias ? c.total / d.kpis.ocorrencias * 100 : 0, 1) + '%</td>' +
+      '<td class="n">' + brl(c.desconto) + '</td>' +
+      '<td class="acoes"><button class="btn mini" data-rel="pdf">PDF</button> <button class="btn mini" data-rel="csv">CSV</button></td></tr>';
+  }).join('') : '<tr><td colspan="' + cols.length + '" class="muted" style="text-align:center;padding:20px">Nenhum colaborador com erro no período.</td></tr>') + '</tbody>';
+  ligarOrdenacao(t, E.ordRanking, renderRanking);
+}
+$('r-busca').addEventListener('input', renderRanking);
+$('t-ranking').addEventListener('click', function (e) {
+  var tr = e.target.closest('tr[data-cod]'); if (!tr) return;
+  var rel = e.target.closest('[data-rel]');
+  if (rel) {
+    var f = coletarFiltros(); f.cod = tr.dataset.cod; f.empColab = tr.dataset.empresa;
+    if (rel.dataset.rel === 'pdf') baixarPdf(f); else baixarCsv(f, 'detalhado');
+    return;
+  }
+  definirColabFiltro(tr.dataset.cod, tr.dataset.nome, tr.dataset.empresa);
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
+function renderDetalhe() {
+  var d = E.painel; if (!d) return;
+  var q = norm($('d-busca').value), gestor = E.usuario.perfil !== 'USER';
+  var lista = d.lista.filter(function (l) {
+    return !q || norm([l.cod, l.colaborador, l.equipe, l.tipos.join(' '), l.pedido, l.observacao, l.lancadoPor, l.dataHora].join(' ')).indexOf(q) >= 0;
+  });
+  lista = ordenar(lista, E.ordDetalhe);
+  var paginas = Math.max(1, Math.ceil(lista.length / POR_PAGINA));
+  if (E.pagDetalhe > paginas) E.pagDetalhe = paginas;
+  var pag = lista.slice((E.pagDetalhe - 1) * POR_PAGINA, E.pagDetalhe * POR_PAGINA);
+  var cols = [{ t: 'Data/hora', k: 'ts' }, { t: 'Colaborador', k: 'colaborador' }, { t: 'Equipe', k: 'equipe' }, { t: 'Tipos de erro' }, { t: 'Desconto', k: 'desconto', n: 1 },
+    { t: 'Pedido/carga', k: 'pedido' }, { t: 'Qtd.', k: 'quantidade', n: 1 }, { t: 'Observação' }, { t: 'Lançado por', k: 'lancadoPor' }];
+  if (gestor) cols.push({ t: '' });
+  var t = $('t-detalhe');
+  t.innerHTML = cabecalho(cols, E.ordDetalhe) + '<tbody>' + (pag.length ? pag.map(function (l) {
+    return '<tr><td style="white-space:nowrap">' + esc(l.dataHora) + '</td><td>' + esc(l.cod) + ' · ' + esc(l.colaborador) +
+      (d.porFilial.length > 1 ? ' <small class="muted">' + esc(l.filial) + '</small>' : '') + '</td><td>' + esc(l.equipe) + '</td><td style="white-space:nowrap">' +
+      l.tipos.map(tagTipo).join('') + '</td><td class="n">' + brl(l.desconto) + '</td><td>' + esc(l.pedido) + '</td><td class="n">' + esc(l.quantidade === '' ? '' : num(l.quantidade, l.quantidade % 1 ? 2 : 0)) +
+      '</td><td>' + esc(l.observacao) + '</td><td>' + esc(l.lancadoPor) + '</td>' +
+      (gestor ? '<td class="acoes"><button class="btn mini" data-cancelar="' + esc(l.id) + '">Cancelar</button></td>' : '') + '</tr>';
+  }).join('') : '<tr><td colspan="' + cols.length + '" class="muted" style="text-align:center;padding:20px">Nenhum lançamento.</td></tr>') + '</tbody>';
+  ligarOrdenacao(t, E.ordDetalhe, renderDetalhe);
+  var aviso = d.totalLista > d.lista.length ? ' (exibindo os ' + num(d.lista.length) + ' mais recentes de ' + num(d.totalLista) + ' — use o CSV para todos)' : '';
+  $('d-pag').innerHTML = num(lista.length) + ' lançamento(s)' + aviso + ' · página ' + E.pagDetalhe + ' de ' + paginas +
+    ' <button class="btn mini" data-pg="-1"' + (E.pagDetalhe <= 1 ? ' disabled' : '') + '>‹ Anterior</button>' +
+    '<button class="btn mini" data-pg="1"' + (E.pagDetalhe >= paginas ? ' disabled' : '') + '>Próxima ›</button>';
+}
+$('d-busca').addEventListener('input', function () { E.pagDetalhe = 1; renderDetalhe(); });
+$('d-pag').addEventListener('click', function (e) { var b = e.target.closest('[data-pg]'); if (b) { E.pagDetalhe += +b.dataset.pg; renderDetalhe(); } });
+$('t-detalhe').addEventListener('click', function (e) {
+  var b = e.target.closest('[data-cancelar]'); if (b) pedirCancelamento(b.dataset.cancelar, carregarPainel);
+});
+
+/* ---------- exportação ---------- */
+var drop = document.querySelector('.menu-drop');
+$('btn-csv').addEventListener('click', function (e) { e.stopPropagation(); drop.classList.toggle('aberto'); });
+document.addEventListener('click', function () { drop.classList.remove('aberto'); });
+drop.querySelector('.drop').addEventListener('click', function (e) {
+  var b = e.target.closest('[data-csv]'); if (b) { drop.classList.remove('aberto'); baixarCsv(coletarFiltros(), b.dataset.csv); }
+});
+$('btn-pdf').addEventListener('click', function () { baixarPdf(coletarFiltros()); });
+
+function baixarCsv(f, tipo) {
+  carregando(true);
+  api('exportarCsv', E.token, f, tipo).then(function (r) { carregando(false); baixar(r.nome, r.conteudo, 'text/csv;charset=utf-8'); toast('CSV gerado.', 'ok'); })
+    .catch(function (e) { carregando(false); erroToast(e); });
+}
+function baixarPdf(f) {
+  carregando(true);
+  api('gerarPdf', E.token, f).then(function (r) { carregando(false); baixar(r.nome, r.base64, 'application/pdf', true); toast('PDF gerado.', 'ok'); })
+    .catch(function (e) { carregando(false); erroToast(e); });
+}
+
+/* =====================================================================
+ *  USUÁRIOS
+ * ===================================================================== */
+function atualizarBadgePendentes() {
+  api('listarUsuarios', E.token).then(function (r) { E.usuarios = r.usuarios; E.filiais = r.filiais; badge(); }).catch(function () { });
+}
+function badge() {
+  var n = E.usuarios.filter(function (u) { return u.status === 'PENDENTE'; }).length;
+  $('badge-pend').textContent = n; $('badge-pend').classList.toggle('oculto', !n);
+}
+function carregarUsuarios() {
+  $('t-usuarios').innerHTML = '<tbody><tr><td class="muted" style="padding:20px">Carregando…</td></tr></tbody>';
+  carregarColabs().catch(function () { });
+  api('listarUsuarios', E.token).then(function (r) {
+    E.usuarios = r.usuarios; E.filiais = r.filiais; badge();
+    $('u-lib-info').textContent = r.exigeCodigo
+      ? 'Ao liberar, o sistema gera um código de 6 dígitos (válido por ' + r.horas + 'h). Entregue-o ao colaborador: ele digita o código produtivo, o código de liberação e cria a própria senha.'
+      : 'Ao liberar, o colaborador digita o código produtivo e cria a própria senha (válido por ' + r.horas + 'h).';
+    renderUsuarios();
+  }).catch(erroToast);
+}
+function renderUsuarios() {
+  var q = norm($('u-busca').value), st = $('u-filtro-status').value, admin = E.usuario.perfil === 'ADMIN';
+  var l = E.usuarios.filter(function (u) {
+    return (!st || u.status === st) && (!q || norm(u.cod + ' ' + u.nome + ' ' + u.filial + ' ' + u.perfil).indexOf(q) >= 0);
+  });
+  var cols = ['Código', 'Nome', 'Perfil', 'Filial', 'Status', 'Último acesso', 'Liberado por', ''];
+  $('t-usuarios').innerHTML = '<thead><tr>' + cols.map(function (c) { return '<th class="sem-ord">' + c + '</th>'; }).join('') + '</tr></thead><tbody>' +
+    (l.length ? l.map(function (u) {
+      var a = [];
+      if (u.podeGerenciar) {
+        if (u.status === 'PENDENTE' || u.status === 'INATIVO') a.push(['liberar', 'Liberar', 'primario']);
+        if (u.status === 'LIBERADO') a.push(['liberar', 'Novo código', '']);
+        if (u.status === 'ATIVO') a.push(['liberar', 'Resetar senha', '']);
+        if (u.status === 'ATIVO' || u.status === 'LIBERADO') a.push(['BLOQUEAR', 'Bloquear', '']);
+        if (u.status === 'BLOQUEADO' || u.status === 'BLOQ. TEMPORÁRIO') a.push(['DESBLOQUEAR', 'Desbloquear', '']);
+        if (u.status === 'PENDENTE') a.push(['INATIVAR', 'Recusar', '']);
+        else if (u.status !== 'INATIVO') a.push(['INATIVAR', 'Inativar', '']);
+        if (admin) a.push(['perfil', 'Perfil', '']);
+      }
+      var stc = u.status.indexOf('BLOQ') === 0 ? 'BLOQ' : u.status;
+      return '<tr><td>' + esc(u.cod) + '</td><td><b>' + esc(u.nome) + '</b>' + (multiEmpresa() ? '<br><small class="muted">' + esc(u.empresa) + '</small>' : '') + '</td><td><span class="pf pf-' + esc(u.perfil) + '">' + esc(u.perfil) +
+        '</span></td><td>' + esc(u.filial) + '</td><td><span class="st st-' + esc(stc) + '">' + esc(u.status) + '</span>' +
+        (u.status === 'LIBERADO' && u.liberacaoExpira ? '<br><small class="muted">expira ' + esc(u.liberacaoExpira) + '</small>' : '') +
+        '</td><td>' + esc(u.ultimoAcesso || '—') + '</td><td><small>' + esc(u.liberadoPor) + (u.liberadoEm ? '<br><span class="muted">' + esc(u.liberadoEm) + '</span>' : '') +
+        '</small></td><td class="acoes">' + a.map(function (x) {
+          return '<button class="btn mini ' + x[2] + '" data-acao="' + x[0] + '" data-cod="' + esc(u.cod) + '" data-empresa="' + esc(u.empresa) + '">' + x[1] + '</button>';
+        }).join(' ') + '</td></tr>';
+    }).join('') : '<tr><td colspan="8" class="muted" style="text-align:center;padding:20px">Nenhum usuário.</td></tr>') + '</tbody>';
+}
+$('u-busca').addEventListener('input', renderUsuarios);
+$('u-filtro-status').addEventListener('change', renderUsuarios);
+
+var _libSel = null;
+criarCombo($('u-lib-cod'), $('u-lib-sug'), buscarColabs, function (c) { _libSel = c; $('u-lib-cod').value = c.cod + ' — ' + c.nome; });
+$('u-lib-cod').addEventListener('input', function () { _libSel = null; });
+$('f-liberar').addEventListener('submit', function (e) {
+  e.preventDefault();
+  var cod = _libSel ? _libSel.cod : $('u-lib-cod').value.trim();
+  if (!/^\w+$/.test(cod)) { toast('Selecione um colaborador da lista ou digite o código produtivo.', 'erro'); return; }
+  var emp = _libSel ? _libSel.filial : '';
+  if (!_libSel) {
+    var achados = E.colabs.filter(function (c) { return c.cod === cod; });
+    if (achados.length > 1) { toast('Esse código existe em mais de uma empresa: escolha o colaborador na lista.', 'erro'); return; }
+    if (achados.length === 1) emp = achados[0].filial;
+  }
+  liberar(emp, cod);
+});
+
+function acharUsuario(emp, cod) { return E.usuarios.filter(function (x) { return x.cod === cod && (!emp || chaveEmp(x.empresa) === chaveEmp(emp)); })[0]; }
+function liberar(emp, cod) {
+  var u = acharUsuario(emp, cod);
+  var acao = u && u.status === 'ATIVO' ? 'resetar a senha de' : 'liberar o primeiro acesso de';
+  modal('Confirmar', '<p>Deseja ' + acao + ' <b>' + esc(u ? u.nome : 'código ' + cod) + '</b>?' +
+    (u && u.status === 'ATIVO' ? '<br><small class="muted">A senha atual deixa de funcionar e o colaborador cria uma nova.</small>' : '') + '</p>',
+    [{ txt: 'Cancelar' }, { txt: 'Liberar', cls: 'primario', fn: function () {
+      carregando(true);
+      api('liberarAcesso', E.token, emp, cod).then(function (r) {
+        carregando(false);
+        $('u-lib-cod').value = ''; _libSel = null;
+        modal('Acesso liberado',
+          '<p><b>' + esc(r.nome) + '</b> (código ' + esc(r.cod) + ' · ' + esc(r.empresa) + ') já pode criar a senha.</p>' +
+          '<p class="muted peq">No login ele escolhe a empresa <b>' + esc(r.empresa) + '</b> e digita o código produtivo.</p>' +
+          (r.codigo ? '<p>Entregue este <b>código de liberação</b> ao colaborador:</p><div class="codigo-lib">' + esc(r.codigo) + '</div>' +
+            '<p class="muted peq">Válido por ' + r.horas + 'h. Por segurança, ele não será mostrado novamente — se perder, gere um novo.</p>'
+            : '<p class="muted">Válido por ' + r.horas + 'h.</p>'),
+          [{ txt: 'Entendi', cls: 'primario' }]);
+        carregarUsuarios();
+      }).catch(function (e) { carregando(false); erroToast(e); });
+      return false;
+    } }]);
+}
+
+$('t-usuarios').addEventListener('click', function (e) {
+  var b = e.target.closest('[data-acao]'); if (!b) return;
+  var cod = b.dataset.cod, emp = b.dataset.empresa, acao = b.dataset.acao, u = acharUsuario(emp, cod);
+  if (acao === 'liberar') return liberar(emp, cod);
+  if (acao === 'perfil') return editarPerfil(u);
+  var nomes = { BLOQUEAR: 'bloquear', DESBLOQUEAR: 'desbloquear', INATIVAR: u.status === 'PENDENTE' ? 'recusar a solicitação de' : 'inativar' };
+  modal('Confirmar', '<p>Deseja ' + nomes[acao] + ' <b>' + esc(u.nome) + '</b>?</p>', [{ txt: 'Cancelar' }, { txt: 'Confirmar', cls: acao === 'DESBLOQUEAR' ? 'primario' : 'perigo', fn: function () {
+    carregando(true);
+    api('alterarStatusUsuario', E.token, emp, cod, acao).then(function () { carregando(false); fecharModal(); toast('Usuário atualizado.', 'ok'); carregarUsuarios(); })
+      .catch(function (e) { carregando(false); erroToast(e); });
+    return false;
+  } }]);
+});
+
+function editarPerfil(u) {
+  var filiais = ['TODAS'].concat(E.filiais);
+  if (filiais.indexOf(u.filial) < 0) filiais.push(u.filial);
+  modal('Perfil de ' + u.nome,
+    '<label>Perfil</label><select id="pf-perfil">' + ['USER', 'GESTOR', 'ADMIN'].map(function (p) {
+      return '<option value="' + p + '"' + (p === u.perfil ? ' selected' : '') + '>' + { USER: 'User — só lançamento', GESTOR: 'Gestor — lançamento, painel e liberação de usuários', ADMIN: 'Admin — acesso total' }[p] + '</option>';
+    }).join('') + '</select>' +
+    '<label>Filial que pode ver / gerenciar</label><select id="pf-filial">' + filiais.map(function (f) {
+      return '<option' + (f === u.filial ? ' selected' : '') + '>' + esc(f) + '</option>';
+    }).join('') + '</select><p class="muted peq">TODAS = enxerga todas as filiais. O usuário precisará entrar novamente.</p>',
+    [{ txt: 'Cancelar' }, { txt: 'Salvar', cls: 'primario', fn: function () {
+      carregando(true);
+      api('definirPerfil', E.token, u.empresa, u.cod, $('pf-perfil').value, $('pf-filial').value).then(function () {
+        carregando(false); fecharModal(); toast('Perfil atualizado.', 'ok'); carregarUsuarios();
+      }).catch(function (e) { carregando(false); erroToast(e); });
+      return false;
+    } }]);
+}
+
+/* =====================================================================
+ *  CONFIGURAÇÕES (ADMIN)
+ * ===================================================================== */
+function carregarConfig() {
+  api('listarTipos', E.token).then(function (l) { E.tiposCfg = l; l.forEach(function (t, i) { E.tipoIdx[t.nome] = i; }); renderTiposCfg(); }).catch(erroToast);
+  api('lerConfig', E.token).then(renderConfig).catch(erroToast);
+  api('listarAuditoria', E.token).then(function (l) { E.auditoria = l; renderAuditoria(); }).catch(erroToast);
+}
+function renderTiposCfg() {
+  $('t-tipos').innerHTML = '<thead><tr><th class="sem-ord">Cor</th><th class="sem-ord">Nome</th><th class="sem-ord n">Ordem</th><th class="sem-ord">Ativo</th><th class="sem-ord"></th></tr></thead><tbody>' +
+    E.tiposCfg.map(function (t) {
+      return '<tr data-id="' + esc(t.id) + '"><td><span class="tag"><span class="bola" style="background:' + corTipo(t.nome) + '"></span></span></td>' +
+        '<td><input class="tp-nome" value="' + esc(t.nome) + '" maxlength="40"></td>' +
+        '<td class="n"><input class="tp-ordem" type="number" value="' + t.ordem + '" style="width:70px"></td>' +
+        '<td><input class="tp-ativo" type="checkbox"' + (t.ativo ? ' checked' : '') + ' style="width:auto"></td>' +
+        '<td class="acoes"><button class="btn mini" data-salvar-tipo>Salvar</button></td></tr>';
+    }).join('') + '</tbody>';
+}
+$('t-tipos').addEventListener('click', function (e) {
+  var b = e.target.closest('[data-salvar-tipo]'); if (!b) return;
+  var tr = b.closest('tr');
+  salvarTipoCfg({ id: tr.dataset.id, nome: tr.querySelector('.tp-nome').value, ordem: tr.querySelector('.tp-ordem').value, ativo: tr.querySelector('.tp-ativo').checked });
+});
+$('btn-novo-tipo').addEventListener('click', function () {
+  modal('Novo tipo de erro', '<label>Nome</label><input id="nt-nome" maxlength="40">', [{ txt: 'Cancelar' }, { txt: 'Criar', cls: 'primario', fn: function () {
+    salvarTipoCfg({ nome: $('nt-nome').value, ativo: true }); return true;
+  } }]);
+});
+function salvarTipoCfg(t) {
+  carregando(true);
+  api('salvarTipo', E.token, t).then(function () { carregando(false); toast('Tipo de erro salvo.', 'ok'); carregarConfig(); carregarLancamento(); E.painel = null; })
+    .catch(function (e) { carregando(false); erroToast(e); });
+}
+function renderConfig(l) {
+  $('f-config').innerHTML = l.map(function (c) {
+    var rotulos = { DESCONTO_VALOR: 'Valor do desconto (R$)', DESCONTO_MODO: 'Cálculo do desconto', RH_PLANILHA_ID: 'ID da planilha do RH',
+      RH_ABA_COLABORADORES: 'Aba de colaboradores', EXIGIR_CODIGO_LIBERACAO: 'Exigir código de liberação no primeiro acesso' };
+    var campo;
+    if (c.chave === 'EXIGIR_CODIGO_LIBERACAO')
+      campo = '<select name="' + esc(c.chave) + '"><option' + (c.valor !== 'NAO' ? ' selected' : '') + '>SIM</option><option' + (c.valor === 'NAO' ? ' selected' : '') + '>NAO</option></select>';
+    else if (c.chave === 'DESCONTO_MODO')
+      campo = '<select name="DESCONTO_MODO" id="cfg-modo"><option value="POR_LANCAMENTO"' + (c.valor !== 'POR_ERRO' ? ' selected' : '') + '>Por lançamento (grupo de erros conta 1 vez)</option>' +
+        '<option value="POR_ERRO"' + (c.valor === 'POR_ERRO' ? ' selected' : '') + '>Por erro (cada erro marcado conta)</option></select>';
+    else if (c.chave === 'DESCONTO_VALOR')
+      campo = '<input name="DESCONTO_VALOR" id="cfg-valor" value="' + esc(c.valor) + '" inputmode="decimal" maxlength="12">';
+    else campo = '<input name="' + esc(c.chave) + '" value="' + esc(c.valor) + '" maxlength="200">';
+    return '<label>' + esc(rotulos[c.chave] || c.chave) + '<small>' + esc(c.descricao) + '</small></label>' + campo +
+      (c.chave === 'DESCONTO_MODO' ? '<p class="exemplo-desc" id="cfg-exemplo"></p>' : '');
+  }).join('') + '<button class="btn primario" type="submit" style="margin-top:12px">Salvar parâmetros</button>';
+  exemploDesconto();
+}
+/** Exemplo ao vivo: lançamento com Falta + Sobra + Avaria. */
+function exemploDesconto() {
+  var ex = $('cfg-exemplo'); if (!ex) return;
+  var v = Number(String($('cfg-valor').value).replace(/\s|R\$/g, '').replace(',', '.')) || 0, porErro = $('cfg-modo').value === 'POR_ERRO';
+  ex.innerHTML = 'Exemplo: um lançamento com <b>Falta</b> → ' + brl(v) + ' · com <b>Falta + Sobra + Avaria</b> → ' + brl(porErro ? v * 3 : v) +
+    '<br><small>A regra vale para os lançamentos feitos depois de salvar; os anteriores mantêm a regra do dia em que foram lançados.</small>';
+}
+$('f-config').addEventListener('input', exemploDesconto);
+$('f-config').addEventListener('change', exemploDesconto);
+
+$('f-config').addEventListener('submit', function (e) {
+  e.preventDefault();
+  var v = {}; Array.prototype.forEach.call(this.elements, function (el) { if (el.name) v[el.name] = el.value; });
+  carregando(true);
+  api('salvarConfig', E.token, v).then(function () { carregando(false); toast('Parâmetros salvos.', 'ok'); E.colabsCarregados = false; E.painel = null; carregarConfig(); })
+    .catch(function (e) { carregando(false); erroToast(e); });
+});
+$('btn-diag').addEventListener('click', function () {
+  var p = $('diag'); p.classList.remove('oculto'); p.textContent = 'Lendo…';
+  api('diagnosticoColaboradores', E.token).then(function (d) {
+    var t = 'Planilha: ' + d.planilha + '\nAba: ' + d.aba + '\nTotal de colaboradores: ' + d.total + '\n\nColunas detectadas:\n';
+    Object.keys(d.colunas).forEach(function (k) { t += '  ' + k + ' → ' + d.colunas[k] + '\n'; });
+    t += '\nPor filial:\n';
+    Object.keys(d.porFilial).forEach(function (k) { t += '  ' + k + ': ' + d.porFilial[k].ativos + ' ativos, ' + d.porFilial[k].inativos + ' inativos\n'; });
+    t += '\nExemplos:\n' + d.exemplo.map(function (c) { return '  ' + c.cod + ' | ' + c.nome + ' | ' + c.filial + ' | ' + c.equipe + ' | ' + c.situacao; }).join('\n');
+    p.textContent = t;
+  }).catch(function (e) { p.textContent = 'Erro: ' + e.message; });
+});
+$('btn-atualizar-colab').addEventListener('click', function () {
+  carregando(true);
+  api('atualizarColaboradores', E.token).then(function (r) { carregando(false); toast(r.total + ' colaboradores recarregados.', 'ok'); return carregarColabs(true); })
+    .catch(function (e) { carregando(false); erroToast(e); });
+});
+function renderAuditoria() {
+  var q = norm($('a-busca').value);
+  var l = E.auditoria.filter(function (a) { return !q || norm(a.cod + ' ' + a.nome + ' ' + a.acao + ' ' + a.detalhe).indexOf(q) >= 0; });
+  $('t-auditoria').innerHTML = '<thead><tr><th class="sem-ord">Data/hora</th><th class="sem-ord">Usuário</th><th class="sem-ord">Ação</th><th class="sem-ord">Detalhe</th></tr></thead><tbody>' +
+    l.map(function (a) { return '<tr><td style="white-space:nowrap">' + esc(a.dataHora) + '</td><td>' + esc(a.cod) + ' · ' + esc(a.nome) + '</td><td><b>' + esc(a.acao) + '</b></td><td>' + esc(a.detalhe) + '</td></tr>'; }).join('') + '</tbody>';
+}
+$('a-busca').addEventListener('input', renderAuditoria);
+
+/* =====================================================================
+ *  INÍCIO
+ * ===================================================================== */
+(function () {
+  carregarEmpresas();
+  var t = ler('ce_token');
+  if (!t) { mostrarPasso('f-codigo'); return; }
+  carregando(true);
+  api('retomarSessao', t).then(function (r) { carregando(false); iniciarApp(r); })
+    .catch(function () { carregando(false); guardar('ce_token', null); $('login-erro').classList.add('oculto'); mostrarPasso('f-codigo'); });
+})();
+</script>
